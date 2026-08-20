@@ -87,6 +87,7 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
   _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params_dict)
   _initialize_coop_steering(CP, CP_SP, params_dict)
   _initialize_tesla_mads_screen_button(CP, CP_SP, params_dict)
+  _initialize_tesla_auto_speed_limit(CP, CP_SP, params_dict)
   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
   _initialize_stop_and_go(CP, CP_SP, params_dict)
   _initialize_toyota(CP, CP_SP, params_dict)
@@ -127,6 +128,15 @@ def _initialize_tesla_mads_screen_button(CP: structs.CarParams, CP_SP: structs.C
     elif selection == MadsScreenButtonType.FIVE_FINGER:
       CP_SP.flags |= TeslaFlagsSP.MADS_SCREEN_BUTTON_5_FINGER.value
       CP_SP.safetyParam |= TeslaSafetyFlagsSP.MADS_SCREEN_BUTTON_5_FINGER
+
+
+def _initialize_tesla_auto_speed_limit(CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+                                       _params_dict: dict[str, str]) -> None:
+  # 当前版本直接绑定“限速辅助”，仅在具备车辆总线且由 OP 控制纵向时开放安全权限。
+  if (CP.brand == 'tesla' and CP.openpilotLongitudinalControl and
+      CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS):
+    CP_SP.flags |= TeslaFlagsSP.AUTO_SPEED_LIMIT.value
+    CP_SP.safetyParam |= TeslaSafetyFlagsSP.AUTO_SPEED_LIMIT
 
 
 def _initialize_radar_tracks(CP: structs.CarParams, CP_SP: structs.CarParamsSP,

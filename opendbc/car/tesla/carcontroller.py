@@ -7,6 +7,7 @@ from opendbc.car.tesla.teslacan import TeslaCAN
 from opendbc.car.tesla.values import CarControllerParams
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.sunnypilot.car.tesla.coop_steering import CoopSteeringCarController
+from opendbc.sunnypilot.car.tesla.speed_limit_controller import TeslaSpeedLimitController
 
 
 def get_safety_CP():
@@ -20,6 +21,7 @@ class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
     self.coop_steer = CoopSteeringCarController()
+    self.speed_limit_controller = TeslaSpeedLimitController(CP_SP)
     self.apply_angle_last = 0
     self.packer = CANPacker(dbc_names[Bus.party])
     self.tesla_can = TeslaCAN(CP, self.packer)
@@ -30,6 +32,8 @@ class CarController(CarControllerBase):
   def update(self, CC, CC_SP, CS, now_nanos):
     actuators = CC.actuators
     can_sends = []
+    # 自动限速报文与常规控制共用本周期发送队列，并继续受 Panda 安全钩子约束。
+    can_sends.extend(self.speed_limit_controller.update(CC, CS, now_nanos))
 
     # Wait until the override condition clears before steering
     # Canceling is done on rising edge of CS.out.steeringDisengage and is handled generically with CC.cruiseControl.cancel

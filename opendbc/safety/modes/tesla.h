@@ -15,6 +15,9 @@
 #define TESLA_VEHICLE_BUS_ADDR_CHECK \
   {.msg = {{0x3DF, 1, 8, 2U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},    /* UI_status2 */ \
 
+#define TESLA_SPEED_BUTTON_ADDR_CHECK \
+  {.msg = {{0x3C2, 1, 8, 2U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true, .ignore_frequency_check = true}, { 0 }, { 0 }}},   /* VCLEFT_switchStatus */ \
+
 #define TESLA_STEERING_DISENGAGE_TORQUE 500 // cNm
 
 static bool tesla_longitudinal = false;
@@ -41,6 +44,14 @@ bool tesla_has_vehicle_bus = false;
 // Configured MADS screen button finger count (0 = disabled, 3-5 = expected touch-point count)
 extern uint8_t tesla_mads_screen_button_fingers;
 uint8_t tesla_mads_screen_button_fingers = 0U;
+
+// 自动设置速度必须以新鲜的原车空闲帧为模板，并限制发送频率。
+static bool tesla_auto_speed_limit = false;
+static bool tesla_speed_button_rx_template_valid = false;
+static uint8_t tesla_speed_button_rx_template[8] = {0U};
+static uint32_t tesla_speed_button_rx_timestamp = 0U;
+static bool tesla_speed_button_last_tx_valid = false;
+static uint32_t tesla_speed_button_last_tx_timestamp = 0U;
 
 static uint8_t tesla_get_counter(const CANPacket_t *msg) {
 
@@ -215,6 +226,15 @@ static void tesla_rx_hook(const CANPacket_t *msg) {
         mads_button_press = (msg->data[3] == tesla_mads_screen_button_fingers) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
       }
     }
+
+    // 只缓存车辆总线上的右滚轮空闲帧，其他复用值和按键状态均不作为模板。
+    if ((msg->addr == 0x3C2U) && ((msg->data[0] & 0x03U) == 1U) && ((msg->data[3] & 0x3FU) == 0U)) {
+      for (int i = 0; i < 8; i++) {
+        tesla_speed_button_rx_template[i] = msg->data[i];
+      }
+      tesla_speed_button_rx_template_valid = true;
+      tesla_speed_button_rx_timestamp = microsecond_timer_get();
+    }
   }
 
   if (msg->bus == 2U) {
@@ -334,6 +354,32 @@ static bool tesla_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  // 仅允许控制已接管时发送基于新鲜模板的 +1/-1 单格滚轮报文。
+  if (msg->addr == 0x3C2U) {
+    const uint8_t tick = msg->data[3] & 0x3FU;
+    const bool tick_allowed = (tick == 1U) || (tick == 0x3FU);
+    bool template_matches = tesla_speed_button_rx_template_valid;
+    for (int i = 0; i < 8; i++) {
+      if (i == 3) {
+        template_matches &= (msg->data[i] & 0xC0U) == (tesla_speed_button_rx_template[i] & 0xC0U);
+      } else {
+        template_matches &= msg->data[i] == tesla_speed_button_rx_template[i];
+      }
+    }
+    const uint32_t now = microsecond_timer_get();
+    const bool template_fresh = safety_get_ts_elapsed(now, tesla_speed_button_rx_timestamp) <= 1500000U;
+    const bool rate_allowed = !tesla_speed_button_last_tx_valid ||
+                              (safety_get_ts_elapsed(now, tesla_speed_button_last_tx_timestamp) >= 250000U);
+    const bool valid = tesla_has_vehicle_bus && tesla_auto_speed_limit && controls_allowed &&
+                       tick_allowed && template_matches && template_fresh && rate_allowed;
+    if (!valid) {
+      violation = true;
+    } else {
+      tesla_speed_button_last_tx_valid = true;
+      tesla_speed_button_last_tx_timestamp = now;
+    }
+  }
+
   if (violation) {
     tx = false;
   }
@@ -380,6 +426,13 @@ static safety_config tesla_init(uint16_t param) {
     {0x27D, 0, 3, .check_relay = true, .disable_static_blocking = true},  // APS_eacMonitor
   };
 
+  static const CanMsg TESLA_M3_Y_LONG_AUTO_SPEED_TX_MSGS[] = {
+    {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},
+    {0x2b9, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {0x27D, 0, 3, .check_relay = true, .disable_static_blocking = true},
+    {0x3C2, 1, 8, .check_relay = false, .disable_static_blocking = true},
+  };
+
   const uint16_t TESLA_FLAG_FSD_14 = 2;
   tesla_fsd_14 = GET_FLAG(param, TESLA_FLAG_FSD_14);
 
@@ -392,8 +445,10 @@ static safety_config tesla_init(uint16_t param) {
   const uint16_t TESLA_PARAM_SP_MADS_SCREEN_BUTTON_3_FINGER = 2;
   const uint16_t TESLA_PARAM_SP_MADS_SCREEN_BUTTON_4_FINGER = 4;
   const uint16_t TESLA_PARAM_SP_MADS_SCREEN_BUTTON_5_FINGER = 8;
+  const uint16_t TESLA_PARAM_SP_AUTO_SPEED_LIMIT = 1024;
 
   tesla_has_vehicle_bus = GET_FLAG(current_safety_param_sp, TESLA_PARAM_SP_VEHICLE_BUS);
+  tesla_auto_speed_limit = GET_FLAG(current_safety_param_sp, TESLA_PARAM_SP_AUTO_SPEED_LIMIT);
 
   if (GET_FLAG(current_safety_param_sp, TESLA_PARAM_SP_MADS_SCREEN_BUTTON_3_FINGER)) {
     tesla_mads_screen_button_fingers = 3U;
@@ -408,6 +463,10 @@ static safety_config tesla_init(uint16_t param) {
   tesla_stock_aeb = false;
   tesla_stock_steering_control = false;
   tesla_stock_steering_control_prev = false;
+  tesla_speed_button_rx_template_valid = false;
+  tesla_speed_button_rx_timestamp = 0U;
+  tesla_speed_button_last_tx_valid = false;
+  tesla_speed_button_last_tx_timestamp = 0U;
   // we need to assume Autopark/Summon on startup since DI_state is a low freq msg.
   // this is so that we don't fault if starting while these systems are active
   tesla_summon = true;
@@ -422,14 +481,24 @@ static safety_config tesla_init(uint16_t param) {
     TESLA_VEHICLE_BUS_ADDR_CHECK
   };
 
+  static RxCheck tesla_model3_y_auto_speed_rx_checks[] = {
+    TESLA_COMMON_RX_CHECKS
+    TESLA_VEHICLE_BUS_ADDR_CHECK
+    TESLA_SPEED_BUTTON_ADDR_CHECK
+  };
+
   safety_config ret;
-  if (tesla_longitudinal) {
+  if (tesla_longitudinal && tesla_auto_speed_limit) {
+    SET_TX_MSGS(TESLA_M3_Y_LONG_AUTO_SPEED_TX_MSGS, ret);
+  } else if (tesla_longitudinal) {
     SET_TX_MSGS(TESLA_M3_Y_LONG_TX_MSGS, ret);
   } else {
     SET_TX_MSGS(TESLA_M3_Y_TX_MSGS, ret);
   }
 
-  if (tesla_has_vehicle_bus) {
+  if (tesla_has_vehicle_bus && tesla_auto_speed_limit) {
+    SET_RX_CHECKS(tesla_model3_y_auto_speed_rx_checks, ret);
+  } else if (tesla_has_vehicle_bus) {
     SET_RX_CHECKS(tesla_model3_y_vehicle_bus_rx_checks, ret);
   } else {
     SET_RX_CHECKS(tesla_model3_y_rx_checks, ret);
