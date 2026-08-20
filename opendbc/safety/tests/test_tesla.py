@@ -19,6 +19,8 @@ from opendbc.sunnypilot.car.tesla.values import TeslaSafetyFlagsSP
 MSG_DAS_steeringControl = 0x488
 MSG_APS_eacMonitor = 0x27d
 MSG_DAS_Control = 0x2b9
+MSG_VCLEFT_SWITCH_STATUS = 0x3C2
+OBSERVED_SPEED_WHEEL_IDLE = bytes.fromhex("010000c000000000")
 
 
 def round_angle(apply_angle, can_offset=0):
@@ -139,6 +141,12 @@ class TestTeslaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest, 
       "DAS_accelMax": accel_limits[1],
     }
     return self.packer.make_can_msg_safety("DAS_control", bus, values)
+
+  @staticmethod
+  def _speed_wheel_msg(right_ticks=0, data=OBSERVED_SPEED_WHEEL_IDLE):
+    payload = bytearray(data)
+    payload[3] = (payload[3] & 0xC0) | (right_ticks & 0x3F)
+    return libsafety_py.make_CANPacket(MSG_VCLEFT_SWITCH_STATUS, CANBUS.vehicle, payload)
 
   def _accel_msg(self, accel: float):
     # For common.LongitudinalAccelSafetyTest
@@ -431,6 +439,20 @@ class TestTeslaLongitudinalSafety(TestTeslaSafetyBase):
 
   RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_steeringControl, MSG_APS_eacMonitor, MSG_DAS_Control)}
   FWD_BLACKLISTED_ADDRS = {2: [MSG_DAS_steeringControl, MSG_APS_eacMonitor, MSG_DAS_Control]}
+
+  def test_auto_speed_limit_requires_fresh_template_and_controls(self):
+    self.safety.set_current_safety_param_sp(TeslaSafetyFlagsSP.HAS_VEHICLE_BUS | TeslaSafetyFlagsSP.AUTO_SPEED_LIMIT)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, self.SAFETY_PARAM)
+    self.safety.init_tests()
+
+    self.assertTrue(self._rx(self._speed_wheel_msg(0)))
+    self.assertFalse(self._tx(self._speed_wheel_msg(1)))
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._speed_wheel_msg(1)))
+    self.assertFalse(self._tx(self._speed_wheel_msg(2)))
+
+    self.safety.set_timer(1_500_001)
+    self.assertFalse(self._tx(self._speed_wheel_msg(-1)))
 
   def test_no_aeb(self):
     for aeb_event in range(4):
